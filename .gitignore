@@ -8,3 +8,4 @@ __pycache__/
 
 # runtime data
 cidaren/bank.json.lock
+cidaren-server*.log
