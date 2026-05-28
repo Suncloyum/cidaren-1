@@ -1,0 +1,11 @@
+[project]
+name = "cidaren"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = [
+    "flask>=3.1.3",
+    "requests>=2.34.2",
+]
+
+[project.scripts]
+cidaren = "cidaren.web:main"
