@@ -17,6 +17,8 @@ CONFIG_FIELDS = [
     "LLM_URL",
     "LLM_KEY",
     "LLM_MODEL",
+    "COURSE_ID",
+    "STUDY_GRADE",
 ]
 
 DEFAULT_CONFIG = {
@@ -26,6 +28,8 @@ DEFAULT_CONFIG = {
     "LLM_URL": "https://ai.saurlax.com/",
     "LLM_KEY": "",
     "LLM_MODEL": "step-3.6",
+    "COURSE_ID": "CET4_v2",
+    "STUDY_GRADE": "2",
 }
 
 REQUIRED_AUTH_FIELDS = ("USERTOKEN", "ABC", "AUTH_V")
@@ -105,6 +109,10 @@ def save_runtime_config(payload: dict[str, object]) -> dict[str, str]:
         f"LLM_URL={_format_env_value(merged.get('LLM_URL', ''))}",
         f"LLM_KEY={_format_env_value(merged.get('LLM_KEY', ''))}",
         f"LLM_MODEL={_format_env_value(merged.get('LLM_MODEL', ''))}",
+        "",
+        "# 自学任务课程",
+        f"COURSE_ID={_format_env_value(merged.get('COURSE_ID', ''))}",
+        f"STUDY_GRADE={_format_env_value(merged.get('STUDY_GRADE', ''))}",
         "",
     ])
 

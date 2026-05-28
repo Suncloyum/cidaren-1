@@ -4,6 +4,7 @@
 """
 
 import base64, hashlib, json, os, random, re, time, requests, uuid
+import certifi
 
 try:
     from .config import get_missing_auth_fields, get_runtime_config
@@ -13,6 +14,7 @@ except ImportError:  # pragma: no cover
 SALT = "ajfajfamsnfaflfasakljdlalkflak"
 VERSION = "2.7.0.260507_01"
 BASE = "https://app.vocabgo.com/studentv1/api"
+STUDENT_BASE = "https://app.vocabgo.com/student/api"
 BANK_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bank.json")
 WORD_PAT = re.compile(r'\{(\w+)\}')
 
@@ -346,7 +348,7 @@ def _match_mode32(stem, remark, opts, word_defs):
 class Client:
     def __init__(self, usertoken, abc, auth_v, ua=""):
         self.s = requests.Session()
-        self.s.verify = False
+        self.s.verify = certifi.where()
         self.s.headers.update({
             "host": "app.vocabgo.com", "usertoken": usertoken, "abc": abc,
             "authorization-v": auth_v, "x-requested-with": "XMLHttpRequest",
@@ -357,14 +359,14 @@ class Client:
             "user-agent": ua or "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36",
         })
 
-    def _get(self, path, params):
+    def _get(self, path, params, base=BASE):
         params = {**params, "timestamp": _ms(), "version": VERSION, "app_type": 1}
-        return _decrypt(self.s.get(BASE + path, params=params, timeout=20).json())
+        return _decrypt(self.s.get(base + path, params=params, timeout=20).json())
 
-    def _post(self, path, body):
+    def _post(self, path, body, base=BASE):
         body = {**body, "timestamp": _ms(), "version": VERSION}
         body["sign"] = _sign(body); body["app_type"] = 1
-        return _decrypt(self.s.post(BASE + path, json=body, timeout=20).json())
+        return _decrypt(self.s.post(base + path, json=body, timeout=20).json())
 
     def page_task(self, page=1, size=50, search_type="0"):
         return self._post("/Student/ClassTask/PageTask", {"search_type": search_type, "page_count": page, "page_size": size})
@@ -383,18 +385,59 @@ class Client:
     def signin(self):
         return self._post("/Student/TaskStudentSignin/Do", {})
 
+    def study_task_list(self, course_id="CET4_v2"):
+        return self._get("/Student/StudyTask/List", {"course_id": course_id}, base=STUDENT_BASE)
+    def study_start_task(self, course_id, list_id, task_type=3, grade=2):
+        return self._post("/Student/StudyTask/StartTask", {"course_id": course_id, "list_id": list_id, "task_type": task_type, "grade": grade}, base=STUDENT_BASE)
+    def study_task_info(self, task_id, course_id, list_id, task_type=3, grade=2):
+        return self._get("/Student/StudyTask/Info", {"task_id": task_id, "course_id": course_id, "list_id": list_id, "task_type": task_type, "grade": grade}, base=STUDENT_BASE)
+    def study_chose_word_list(self, task_id, course_id, list_id, task_type=3, grade=2):
+        return self._get("/Student/StudyTask/ChoseWordList", {"task_id": task_id, "course_id": course_id, "list_id": list_id, "task_type": task_type, "grade": grade}, base=STUDENT_BASE)
+    def study_submit_chose_word(self, task_id, course_id, list_id, word_map, task_type=3, grade=2):
+        return self._post(
+            "/Student/StudyTask/SubmitChoseWord",
+            {
+                "task_id": task_id,
+                "task_type": task_type,
+                "grade": grade,
+                "course_id": course_id,
+                "list_id": list_id,
+                "word_map": word_map,
+                "chose_err_item": 1,
+                "reset_chose_words": 1,
+            },
+            base=STUDENT_BASE,
+        )
+    def study_start_answer(self, task_id, course_id, list_id, task_type=3, grade=2):
+        return self._get(
+            "/Student/StudyTask/StartAnswer",
+            {"task_id": task_id, "task_type": task_type, "grade": grade, "course_id": course_id, "list_id": list_id, "opt_img_w": 2300, "opt_font_size": 128, "opt_font_c": "#000000", "it_img_w": 2702, "it_font_size": 144},
+            base=STUDENT_BASE,
+        )
+    def study_verify(self, topic_code, answer):
+        return self._post("/Student/StudyTask/VerifyAnswer", {"topic_code": topic_code, "answer": answer}, base=STUDENT_BASE)
+    def study_submit(self, topic_code, time_spent):
+        return self._post(
+            "/Student/StudyTask/SubmitAnswerAndSave",
+            {"topic_code": topic_code, "time_spent": time_spent, "opt_img_w": 2300, "opt_font_size": 128, "opt_font_c": "#000000", "it_img_w": 2702, "it_font_size": 144},
+            base=STUDENT_BASE,
+        )
+
 # ── 主逻辑 ──
 def _get_topic(resp):
     d = (resp or {}).get("data") or {}
     if isinstance(d, dict) and d.get("topic_code"): return d
     return d.get("topic_info") or d.get("topic") or (d.get("topic_list") or [None])[0]
 
-def run_quiz(client, task_id, release_id):
+def run_quiz(client, task_id, release_id=None, task_kind="class", course_id=None, list_id=None, task_type=3, grade=2):
     bank = _bank_load()
     word_defs = {}
     print(f"📚 题库 {len(bank)} 条")
 
-    resp = client.start_answer(task_id, release_id)
+    if task_kind == "study":
+        resp = client.study_start_answer(task_id, course_id, list_id, task_type=task_type, grade=grade)
+    else:
+        resp = client.start_answer(task_id, release_id)
     topic = _get_topic(resp)
     if not topic:
         print(f"❌ StartAnswer 失败: {resp}"); return
@@ -418,7 +461,10 @@ def run_quiz(client, task_id, release_id):
             defs = [o.get("content", "") for o in opts if o.get("content")]
             if defs: word_defs[word] = defs
             print(f"  [{done_now}/{total_now}] 📖 {stem} ({len(defs)}个释义)")
-            save = client.submit(code, random.randint(500, 1500))
+            if task_kind == "study":
+                save = client.study_submit(code, random.randint(500, 1500))
+            else:
+                save = client.submit(code, random.randint(500, 1500))
         elif _is_collocation(topic):
             # 搭配题: 多选, 循环 verify 直到 over_status=1
             opts = topic.get("options") or []
@@ -446,7 +492,10 @@ def run_quiz(client, task_id, release_id):
             cur_code = code
             for ans_tag in tags[:answer_num]:
                 if ans_tag in chosen: continue
-                vr = client.verify(cur_code, ans_tag)
+                if task_kind == "study":
+                    vr = client.study_verify(cur_code, ans_tag)
+                else:
+                    vr = client.verify(cur_code, ans_tag)
                 vd = vr.get("data") or {}
                 cur_code = vd.get("topic_code", cur_code)
                 if vd.get("answer_result") == 1:
@@ -472,7 +521,10 @@ def run_quiz(client, task_id, release_id):
             print(f"  [{done_now}/{total_now}] {tag} 🔗 {stem} → {disp} [{src}]")
 
             spent = random.randint(2000, 4000)
-            save = client.submit(cur_code, spent)
+            if task_kind == "study":
+                save = client.study_submit(cur_code, spent)
+            else:
+                save = client.submit(cur_code, spent)
         else:
             key = _topic_key(topic)
             opts = topic.get("options") or []
@@ -497,7 +549,10 @@ def run_quiz(client, task_id, release_id):
                 answer = 0; src = "guess"
 
             # Verify
-            vr = client.verify(code, answer)
+            if task_kind == "study":
+                vr = client.study_verify(code, answer)
+            else:
+                vr = client.verify(code, answer)
             vd = vr.get("data") or {}
             code = vd.get("topic_code", code)
             ar = vd.get("answer_result")
@@ -518,7 +573,10 @@ def run_quiz(client, task_id, release_id):
                 print(f"  [{done_now}/{total_now}] ⚠️ {_disp_stem(stem, remark)} → {disp} [{src}→fix]")
 
             spent = random.randint(2000, 4000)
-            save = client.submit(code, spent)
+            if task_kind == "study":
+                save = client.study_submit(code, spent)
+            else:
+                save = client.submit(code, spent)
 
         next_t = _get_topic(save)
         sd = save.get("data") or {}
@@ -577,6 +635,86 @@ def run_full(client, task_id=None, release_id=None, task_index=0, max_score=10):
         print("全部满分, 跳过选词")
 
     run_quiz(client, task_id, release_id)
+
+    _sleep(0.5, 1.0)
+    sr = client.signin()
+    sd = sr.get("data") or {}
+    if sd:
+        print(f"🏆 签到完成, 累计{sd.get('sign_in_total')}天, 积分+{sd.get('integral')}")
+
+def run_study_full(client, task_id=None, course_id="CET4_v2", list_id=None, task_type=3, grade=2, task_index=0, max_score=10):
+    try:
+        grade = int(grade)
+    except (TypeError, ValueError):
+        grade = 2
+
+    if not list_id:
+        resp = client.study_task_list(course_id=course_id)
+        recs = (resp.get("data") or {}).get("task_list") or []
+        if not recs: print("❌ 没有自学任务"); return
+        for i, r in enumerate(recs):
+            print(f"  [{i}] {r['task_name']}  进度{r.get('progress')}%  分数{r.get('score')}")
+        chosen = recs[task_index]
+        task_id = chosen.get("task_id")
+        list_id = chosen.get("list_id")
+        task_type = chosen.get("task_type") or task_type
+        grade = chosen.get("grade") or grade
+        course_id = chosen.get("course_id") or course_id
+        print(f"→ 选中: {chosen['task_name']}")
+
+    if task_id is None:
+        task_id = -1
+    try:
+        task_id_num = int(task_id)
+    except (TypeError, ValueError):
+        task_id_num = -1
+    if task_id_num <= 0:
+        start = client.study_start_task(course_id, list_id, task_type=task_type, grade=grade)
+        sd = start.get("data") or {}
+        task_id = sd.get("task_id") or sd.get("id") or task_id
+        try:
+            task_id_num = int(task_id)
+        except (TypeError, ValueError):
+            task_id_num = -1
+        if task_id_num <= 0:
+            latest = client.study_task_list(course_id=course_id)
+            recs = (latest.get("data") or {}).get("task_list") or []
+            for r in recs:
+                if str(r.get("list_id")) == str(list_id):
+                    task_id = r.get("task_id") or task_id
+                    task_type = r.get("task_type") or task_type
+                    grade = r.get("grade") or grade
+                    course_id = r.get("course_id") or course_id
+                    break
+        if not sd and start.get("code") not in (None, 1):
+            print(f"⚠️ StartTask 返回: {start}")
+        print(f"🔄 自学任务已创建, 启动: task_id={task_id}")
+
+    info = client.study_task_info(task_id, course_id, list_id, task_type=task_type, grade=grade)
+    print(f"📋 {(info.get('data') or {}).get('task_name') or list_id}")
+    _sleep(0.5, 1.0)
+
+    chose = client.study_chose_word_list(task_id, course_id, list_id, task_type=task_type, grade=grade)
+    words = (chose.get("data") or {}).get("word_list") or []
+    if not words:
+        print(f"⚠️ 自学选词列表为空/异常，停止进入答题: {chose}")
+        return
+    todo = [w for w in words if w.get("score", 0) < max_score]
+    print(f"📝 总{len(words)}词, 待练{len(todo)}词")
+
+    if todo:
+        word_map = {}
+        for w in todo:
+            key = f"{w.get('course_id') or course_id}:{w.get('list_id') or list_id}"
+            word_map.setdefault(key, []).append(w["word"])
+        saved = client.study_submit_chose_word(task_id, course_id, list_id, word_map, task_type=task_type, grade=grade)
+        if saved.get("code") != 1:
+            print(f"⚠️ 选词返回: {saved}")
+        _sleep(0.5, 1.0)
+    else:
+        print("全部满分, 跳过选词")
+
+    run_quiz(client, task_id=task_id, task_kind="study", course_id=course_id, list_id=list_id, task_type=task_type, grade=grade)
 
     _sleep(0.5, 1.0)
     sr = client.signin()

@@ -37,6 +37,27 @@ JOBS_LOCK = threading.Lock()
 LOG_MAX = 500
 
 
+def _job_key(source, task_id, release_id):
+    return ((source or "class"), str(task_id), str(release_id))
+
+
+def _int_or_default(value, default):
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _find_job(source, task_id, release_id):
+    job = JOBS.get(_job_key(source, task_id, release_id))
+    if job or source != "study":
+        return job
+    for (job_source, _job_task_id, job_release_id), candidate in JOBS.items():
+        if job_source == "study" and job_release_id == str(release_id):
+            return candidate
+    return None
+
+
 def _client(config=None):
     cfg = config or get_runtime_config()
     missing = get_missing_auth_fields(cfg)
@@ -45,9 +66,8 @@ def _client(config=None):
     return quiz.Client(cfg["USERTOKEN"], cfg["ABC"], cfg["AUTH_V"])
 
 
-def _list_tasks():
-    """拉取所有任务, 多页累加"""
-    c = _client()
+def _list_class_tasks(c):
+    """拉取班级任务, 多页累加"""
     out, page = [], 1
     while True:
         resp = c.page_task(page=page, size=50)
@@ -61,6 +81,74 @@ def _list_tasks():
         if page > 20:
             break
     return out
+
+
+def _list_study_tasks(c, course_id):
+    """拉取自学任务"""
+    resp = c.study_task_list(course_id=course_id)
+    data = resp.get("data") or {}
+    return data.get("task_list") or []
+
+
+def _list_tasks():
+    """拉取班级任务 + 自学任务"""
+    cfg = get_runtime_config()
+    c = _client(cfg)
+    course_id = (cfg.get("COURSE_ID") or "CET4_v2").strip() or "CET4_v2"
+    study_grade = _int_or_default(cfg.get("STUDY_GRADE"), 2)
+    out, warnings = [], []
+
+    try:
+        for r in _list_class_tasks(c):
+            tid = r.get("task_id")
+            rid = r.get("release_id")
+            job = _find_job("class", tid, rid)
+            out.append({
+                "source": "class",
+                "source_label": "班级",
+                "can_start": True,
+                "task_id": tid,
+                "release_id": rid,
+                "task_name": r.get("task_name"),
+                "progress": r.get("progress"),
+                "score": r.get("score"),
+                "running": bool(job and not job["done"]),
+                "done": bool(job and job["done"]),
+                "exit_code": job["exit_code"] if job else None,
+                "loop": bool(job and job.get("loop")),
+                "round": job.get("round", 0) if job else 0,
+            })
+    except Exception as e:
+        warnings.append(f"班级任务读取失败: {e}")
+
+    try:
+        for r in _list_study_tasks(c, course_id):
+            tid = r.get("task_id")
+            rid = r.get("list_id")
+            job = _find_job("study", tid, rid)
+            out.append({
+                "source": "study",
+                "source_label": "自学",
+                "can_start": True,
+                "task_id": tid,
+                "release_id": rid,
+                "course_id": r.get("course_id") or course_id,
+                "list_id": rid,
+                "task_type": r.get("task_type"),
+                "grade": _int_or_default(r.get("grade"), study_grade),
+                "task_name": r.get("task_name"),
+                "progress": r.get("progress"),
+                "score": r.get("score"),
+                "running": bool(job and not job["done"]),
+                "done": bool(job and job["done"]),
+                "exit_code": job["exit_code"] if job else None,
+                "loop": bool(job and job.get("loop")),
+                "round": job.get("round", 0) if job else 0,
+            })
+    except Exception as e:
+        warnings.append(f"自学任务读取失败: {e}")
+
+    return out, warnings
 
 
 def _reader_thread(job_id, proc):
@@ -79,7 +167,7 @@ def _reader_thread(job_id, proc):
     # 循环模式: 如果未满分则重新启动
     if job.get("loop") and not job.get("stopped"):
         try:
-            score = _query_score(job["task_id"], job["release_id"])
+            score = _query_score(job["source"], job["task_id"], job["release_id"], job.get("course_id"), job.get("list_id"))
         except Exception as e:
             job["logs"].append(f"[loop] 查询分数失败: {e}")
             score = None
@@ -91,12 +179,29 @@ def _reader_thread(job_id, proc):
         if job.get("stopped"):
             return
         with JOBS_LOCK:
-            _spawn_job(job["task_id"], job["release_id"], loop=True)
+            _spawn_job(
+                job["source"],
+                job["task_id"],
+                job["release_id"],
+                loop=True,
+                course_id=job.get("course_id"),
+                list_id=job.get("list_id"),
+                task_type=job.get("task_type"),
+                grade=job.get("grade"),
+            )
 
 
-def _query_score(task_id, release_id):
+def _query_score(source, task_id, release_id, course_id=None, list_id=None):
     """轻量查询单个任务当前分数"""
     c = _client()
+    if source == "study":
+        resp = c.study_task_list(course_id=course_id or "CET4_v2")
+        recs = (resp.get("data") or {}).get("task_list") or []
+        for r in recs:
+            if str(r.get("list_id")) == str(list_id or release_id) or str(r.get("task_id")) == str(task_id):
+                return r.get("score")
+        return None
+
     page = 1
     while page <= 20:
         resp = c.page_task(page=page, size=50)
@@ -112,32 +217,42 @@ def _query_score(task_id, release_id):
     return None
 
 
-def _spawn_job(task_id, release_id, loop=False, config=None):
+def _spawn_job(source, task_id, release_id, loop=False, config=None, course_id=None, list_id=None, task_type=None, grade=None):
     """启动子进程跑一个 task, 配置通过环境变量透传给 runner。"""
+    if source == "study":
+        args = ["study", str(task_id), str(list_id or release_id), str(course_id or "CET4_v2"), str(task_type or 3), str(grade or 2)]
+    else:
+        args = ["class", str(task_id), str(release_id)]
     proc = subprocess.Popen(
-        [sys.executable, "-u", "-m", "cidaren._runner", str(task_id), str(release_id)],
+        [sys.executable, "-u", "-m", "cidaren._runner", *args],
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
         bufsize=1,
         env=build_subprocess_env(config),
     )
     # 保留旧的 logs (循环模式下追加)
-    old = JOBS.get((task_id, release_id))
+    key = _job_key(source, task_id, release_id)
+    old = JOBS.get(key)
     logs = old["logs"] if old else deque(maxlen=LOG_MAX)
     if old:
         logs.append(f"========== 第 {old.get('round', 1) + 1} 轮启动 ==========")
-    JOBS[(task_id, release_id)] = {
+    JOBS[key] = {
         "proc": proc,
         "logs": logs,
         "started": time.time(),
         "done": False,
         "exit_code": None,
+        "source": source,
         "release_id": release_id,
         "task_id": task_id,
+        "course_id": course_id,
+        "list_id": list_id,
+        "task_type": task_type,
+        "grade": grade,
         "loop": loop,
         "stopped": False,
         "round": (old.get("round", 1) + 1) if old else 1,
     }
-    threading.Thread(target=_reader_thread, args=((task_id, release_id), proc), daemon=True).start()
+    threading.Thread(target=_reader_thread, args=(key, proc), daemon=True).start()
 
 
 # ==== Routes ====
@@ -173,55 +288,48 @@ def api_save_config():
 @app.route("/api/tasks")
 def api_tasks():
     try:
-        recs = _list_tasks()
+        tasks, warnings = _list_tasks()
     except ValueError as e:
         return jsonify({"ok": False, "error": str(e)}), 400
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
-    out = []
-    for r in recs:
-        tid = r.get("task_id")
-        rid = r.get("release_id")
-        job = JOBS.get((tid, rid))
-        out.append({
-            "task_id": tid,
-            "release_id": rid,
-            "task_name": r.get("task_name"),
-            "progress": r.get("progress"),
-            "score": r.get("score"),
-            "running": bool(job and not job["done"]),
-            "done": bool(job and job["done"]),
-            "exit_code": job["exit_code"] if job else None,
-            "loop": bool(job and job.get("loop")),
-            "round": job.get("round", 0) if job else 0,
-        })
-    return jsonify({"ok": True, "tasks": out})
+    return jsonify({"ok": True, "tasks": tasks, "warnings": warnings})
 
 
 @app.route("/api/start", methods=["POST"])
 def api_start():
     body = request.get_json(force=True)
+    source = body.get("source") or "class"
     task_id = int(body["task_id"])
-    release_id = int(body["release_id"])
-    loop = bool(body.get("loop", False))
+    release_id = body["release_id"]
+    if source == "class":
+        release_id = int(release_id)
+    course_id = body.get("course_id")
+    list_id = body.get("list_id") or release_id
+    task_type = int(body.get("task_type") or 3)
     config = get_runtime_config()
+    grade = _int_or_default(body.get("grade") or config.get("STUDY_GRADE"), 2)
+    loop = bool(body.get("loop", False))
     missing = get_missing_auth_fields(config)
     if missing:
         return jsonify({"ok": False, "error": f"请先填写配置: {', '.join(missing)}"}), 400
     with JOBS_LOCK:
-        job = JOBS.get((task_id, release_id))
+        job = _find_job(source, task_id, release_id)
         if job and not job["done"]:
             return jsonify({"ok": False, "error": "任务正在运行"}), 400
-        _spawn_job(task_id, release_id, loop=loop, config=config)
+        _spawn_job(source, task_id, release_id, loop=loop, config=config, course_id=course_id, list_id=list_id, task_type=task_type, grade=grade)
     return jsonify({"ok": True})
 
 
 @app.route("/api/stop", methods=["POST"])
 def api_stop():
     body = request.get_json(force=True)
+    source = body.get("source") or "class"
     task_id = int(body["task_id"])
-    release_id = int(body["release_id"])
-    job = JOBS.get((task_id, release_id))
+    release_id = body["release_id"]
+    if source == "class":
+        release_id = int(release_id)
+    job = _find_job(source, task_id, release_id)
     if not job:
         return jsonify({"ok": False, "error": "任务未运行"}), 400
     # 标记 stopped, 阻断循环重启
@@ -235,9 +343,25 @@ def api_stop():
     return jsonify({"ok": True})
 
 
+@app.route("/api/logs")
+def api_logs_query():
+    source = request.args.get("source") or "class"
+    task_id = request.args.get("task_id")
+    release_id = request.args.get("release_id")
+    job = _find_job(source, task_id, release_id)
+    if not job:
+        return jsonify({"ok": False, "logs": []})
+    return jsonify({
+        "ok": True,
+        "logs": list(job["logs"]),
+        "done": job["done"],
+        "exit_code": job["exit_code"],
+    })
+
+
 @app.route("/api/logs/<int:task_id>/<int:release_id>")
 def api_logs(task_id, release_id):
-    job = JOBS.get((task_id, release_id))
+    job = _find_job("class", task_id, release_id)
     if not job:
         return jsonify({"ok": False, "logs": []})
     return jsonify({
@@ -345,6 +469,16 @@ _INDEX_HTML = '''<!doctype html>
             <small>词达人请求头中的 authorization-v。</small>
           </div>
           <div class="field">
+            <label for="COURSE_ID">COURSE_ID</label>
+            <input id="COURSE_ID" type="text" placeholder="CET4_v2" />
+            <small>自学任务课程 ID。</small>
+          </div>
+          <div class="field">
+            <label for="STUDY_GRADE">STUDY_GRADE</label>
+            <input id="STUDY_GRADE" type="number" min="1" max="4" placeholder="2" />
+            <small>自学模式: 1 快速 / 2 普通 / 3 完整 / 4 超级困难。</small>
+          </div>
+          <div class="field">
             <label for="LLM_URL">LLM_URL</label>
             <input id="LLM_URL" type="text" placeholder="https://ai.saurlax.com/" />
             <small>OpenAI 兼容接口地址，留空表示不启用 LLM 兜底。</small>
@@ -415,7 +549,8 @@ _INDEX_HTML = '''<!doctype html>
 <script>
 let activeLogKey = null;
 let logTimer = null;
-const CONFIG_KEYS = ["USERTOKEN", "ABC", "AUTH_V", "LLM_URL", "LLM_KEY", "LLM_MODEL"];
+let currentTasks = [];
+const CONFIG_KEYS = ["USERTOKEN", "ABC", "AUTH_V", "COURSE_ID", "STUDY_GRADE", "LLM_URL", "LLM_KEY", "LLM_MODEL"];
 
 async function loadConfig() {
   try {
@@ -474,9 +609,11 @@ async function loadTasks() {
     const r = await fetch("/api/tasks");
     const j = await r.json();
     if (!j.ok) throw new Error(j.error);
+    currentTasks = j.tasks;
     render(j.tasks);
+    const warnings = (j.warnings || []).length ? ` · ${j.warnings.join(" · ")}` : "";
     document.getElementById("status").textContent =
-      `共 ${j.tasks.length} 个任务 · 已更新 ${new Date().toLocaleTimeString()}`;
+      `共 ${j.tasks.length} 个任务 · 已更新 ${new Date().toLocaleTimeString()}${warnings}`;
   } catch (e) {
     document.getElementById("status").textContent = "❌ " + e.message;
   }
@@ -492,13 +629,13 @@ function render(tasks) {
     const prog = t.progress || 0;
     const score = t.score == null ? "-" : t.score;
     const scoreCls = t.score >= 100 ? "score full" : "score";
-    let badge = "";
+    let badge = `<span class="badge">${escapeHtml(t.source_label || "")}</span>`;
     if (t.running) {
-      badge = t.loop
-        ? `<span class="badge run">🔁 循环中 (第${t.round}轮)</span>`
-        : `<span class="badge run">运行中</span>`;
+      badge += t.loop
+        ? ` <span class="badge run">🔁 循环中 (第${t.round}轮)</span>`
+        : ` <span class="badge run">运行中</span>`;
     } else if (t.done) {
-      badge = `<span class="badge done">已完成</span>`;
+      badge += ` <span class="badge done">已完成</span>`;
     }
     return `
       <tr>
@@ -511,43 +648,64 @@ function render(tasks) {
         <td class="${scoreCls}">${score}</td>
         <td>${badge}</td>
         <td>
-          ${t.running
-            ? `<button class="danger" onclick="stopTask(${t.task_id}, ${t.release_id})">停止</button>
-               <button onclick="showLogs(${t.task_id}, ${t.release_id}, '${escapeHtml(t.task_name)}')">日志</button>`
-            : `<button class="primary" onclick="startTask(${t.task_id}, ${t.release_id}, false)">▶ 启动</button>
-               <button class="loop" onclick="startTask(${t.task_id}, ${t.release_id}, true)" title="刷到100分为止">🔁 循环</button>
-               ${t.done ? `<button onclick="showLogs(${t.task_id}, ${t.release_id}, '${escapeHtml(t.task_name)}')">日志</button>` : ""}`
+          ${!t.can_start
+            ? `<button disabled title="${escapeHtml(t.note || "暂不支持启动")}">仅展示</button>`
+            : t.running
+            ? `<button class="danger" onclick="stopTask(${i})">停止</button>
+               <button onclick="showLogs(${i})">日志</button>`
+            : `<button class="primary" onclick="startTask(${i}, false)">▶ 启动</button>
+               <button class="loop" onclick="startTask(${i}, true)" title="刷到100分为止">🔁 循环</button>
+               ${t.done ? `<button onclick="showLogs(${i})">日志</button>` : ""}`
           }
         </td>
       </tr>`;
   }).join("");
 }
 
-async function startTask(taskId, releaseId, loop) {
+function taskPayload(task, loop) {
+  return {
+    source: task.source || "class",
+    task_id: task.task_id,
+    release_id: task.release_id,
+    course_id: task.course_id,
+    list_id: task.list_id,
+    task_type: task.task_type,
+    grade: task.grade,
+    loop: !!loop,
+  };
+}
+
+async function startTask(index, loop) {
+  const task = currentTasks[index];
+  if (!task) return;
   const r = await fetch("/api/start", {
     method: "POST", headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ task_id: taskId, release_id: releaseId, loop: !!loop })
+    body: JSON.stringify(taskPayload(task, loop))
   });
   const j = await r.json();
   if (!j.ok) { alert("启动失败: " + j.error); return; }
-  showLogs(taskId, releaseId, "Task " + taskId + (loop ? " 🔁" : ""));
+  showLogs(index, loop);
   loadTasks();
 }
 
-async function stopTask(taskId, releaseId) {
+async function stopTask(index) {
+  const task = currentTasks[index];
+  if (!task) return;
   if (!confirm("停止任务?")) return;
   const r = await fetch("/api/stop", {
     method: "POST", headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ task_id: taskId, release_id: releaseId })
+    body: JSON.stringify(taskPayload(task, false))
   });
   const j = await r.json();
   if (!j.ok) alert("停止失败: " + j.error);
   loadTasks();
 }
 
-async function showLogs(taskId, releaseId, title) {
-  activeLogKey = [taskId, releaseId];
-  document.getElementById("modal-title").textContent = "📜 " + title;
+async function showLogs(index, loop) {
+  const task = currentTasks[index];
+  if (!task) return;
+  activeLogKey = taskPayload(task, false);
+  document.getElementById("modal-title").textContent = "📜 " + task.task_name + (loop ? " 🔁" : "");
   document.getElementById("modal").classList.add("show");
   await refreshLogs();
   if (logTimer) clearInterval(logTimer);
@@ -563,8 +721,12 @@ function closeLogs() {
 async function refreshLogs() {
   if (!activeLogKey) return;
   try {
-    const [tid, rid] = activeLogKey;
-    const r = await fetch(`/api/logs/${tid}/${rid}`);
+    const qs = new URLSearchParams({
+      source: activeLogKey.source || "class",
+      task_id: activeLogKey.task_id,
+      release_id: activeLogKey.release_id,
+    });
+    const r = await fetch(`/api/logs?${qs.toString()}`);
     const j = await r.json();
     if (j.ok) {
       const box = document.getElementById("modal-logs");
