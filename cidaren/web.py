@@ -5,7 +5,7 @@
 - 定时刷新分数和子进程日志
 - 支持在前端编辑 token / LLM 配置并同步写入 .env
 """
-import os, sys, subprocess, threading, time, signal
+import os, sys, subprocess, threading, time
 from collections import deque
 from flask import Flask, jsonify, request, Response
 
@@ -337,7 +337,7 @@ def api_stop():
     job["loop"] = False
     if not job["done"]:
         try:
-            job["proc"].send_signal(signal.SIGTERM)
+            job["proc"].terminate()
         except Exception as e:
             return jsonify({"ok": False, "error": str(e)}), 500
     return jsonify({"ok": True})

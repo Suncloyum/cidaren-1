@@ -3,8 +3,10 @@
 支持 mode=0/11/31/32 全题型, 匹配不上时用 LLM 兜底
 """
 
-import base64, hashlib, json, os, random, re, time, requests, uuid
+import base64, hashlib, json, os, random, re, time, requests, uuid, certifi
 from contextlib import contextmanager
+
+os.environ["SSL_CERT_FILE"] = certifi.where()
 
 try:
     from .config import get_missing_auth_fields, get_runtime_config
@@ -212,7 +214,7 @@ def _llm_answer(topic, word_defs):
         last_err = None
         for attempt in range(3):
             try:
-                resp = requests.post(url, headers=headers, json=data, timeout=(10, 60))
+                resp = requests.post(url, headers=headers, json=data, timeout=(10, 60), verify=certifi.where())
                 resp.raise_for_status()
                 break
             except (requests.Timeout, requests.ConnectionError) as e:
@@ -344,6 +346,7 @@ class Client:
             "referer": "https://app.vocabgo.com/student/",
             "user-agent": ua or "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36 NetType/WIFI MicroMessenger/7.0.20.1781(0x6700143B) WindowsWechat(0x63090a13) UnifiedPCWindowsWechat(0xf254173b) XWEB/19027 Flue",
         })
+        self.s.verify = certifi.where()
 
     def _get(self, path, params, base=BASE):
         params = {**params, "timestamp": _ms(), "version": VERSION, "app_type": 1}
